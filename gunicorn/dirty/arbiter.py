@@ -17,7 +17,7 @@ import signal
 import tempfile
 import time
 
-from gunicorn import util
+from gunicorn import appload, util
 
 from .app import get_app_workers_attribute, parse_dirty_app_spec
 from .errors import (
@@ -235,6 +235,10 @@ class DirtyArbiter:
         """Run the dirty arbiter (blocking call)."""
         self.pid = os.getpid()
         self.log.info("Dirty arbiter starting (pid: %s)", self.pid)
+
+        # The dirty subtree now runs in its own process but stays on the
+        # same Arbiter-tree profile as the HTTP master.
+        appload.note_dirty_arbiter_boot(self)
 
         # Write PID to well-known location for orphan detection
         if self.pidfile:
@@ -984,6 +988,11 @@ class DirtyArbiter:
 
             # Register which apps this worker has
             self._register_worker_apps(pid, app_paths)
+
+            # Fork boundary of the out-of-process carrier. app_paths is the
+            # worker's exact (possibly limited) assignment; the child side
+            # is appload.note_dirty_worker_boot()/note_dirty_init().
+            appload.note_dirty_worker_spawn(self, pid, app_paths)
 
             self.cfg.dirty_post_fork(self, worker)
             self.log.info("Spawned dirty worker (pid: %s) with apps: %s",

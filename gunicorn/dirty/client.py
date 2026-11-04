@@ -17,6 +17,8 @@ import threading
 import time
 import uuid
 
+from gunicorn import appload
+
 from .errors import (
     DirtyConnectionError,
     DirtyError,
@@ -51,6 +53,13 @@ class DirtyClient:
         self._reader = None
         self._writer = None
         self._lock = threading.Lock()
+
+    def _note_appload_call(self, app_path, action, mode):
+        # The HTTP side reaches the dirty app *only* here, by sending a
+        # message over the Unix socket. The app class itself is never
+        # imported in this process (that happens on the dirty_init pin in
+        # the dirty worker address space).
+        appload.note_dirty_call(app_path, action, mode, self.socket_path)
 
     # -------------------------------------------------------------------------
     # Sync API (for sync HTTP workers)
@@ -116,6 +125,7 @@ class DirtyClient:
 
         try:
             # Send request
+            self._note_appload_call(app_path, action, "execute")
             DirtyProtocol.write_message(self._sock, request)
 
             # Receive response
@@ -254,6 +264,7 @@ class DirtyClient:
 
         try:
             # Send request
+            self._note_appload_call(app_path, action, "execute_async")
             await DirtyProtocol.write_message_async(self._writer, request)
 
             # Receive response with timeout
@@ -412,6 +423,8 @@ class DirtyStreamIterator:
                 args=self.args,
                 kwargs=self.kwargs,
             )
+            self.client._note_appload_call(
+                self.app_path, self.action, "stream")
             DirtyProtocol.write_message(self.client._sock, request)
 
     def _read_next_chunk(self):
@@ -555,6 +568,8 @@ class DirtyAsyncStreamIterator:
             args=self.args,
             kwargs=self.kwargs,
         )
+        self.client._note_appload_call(
+            self.app_path, self.action, "stream_async")
         await DirtyProtocol.write_message_async(self.client._writer, request)
 
     # Threshold for applying timeout wrapper (seconds)

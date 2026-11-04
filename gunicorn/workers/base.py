@@ -12,7 +12,7 @@ from datetime import datetime
 from random import randint
 from ssl import SSLError
 
-from gunicorn import util
+from gunicorn import appload, util
 from gunicorn.http.errors import (
     ChunkMissingTerminator, ForbiddenProxyRequest,
     InvalidChunkExtension, InvalidChunkSize, InvalidHeader,
@@ -92,6 +92,11 @@ class Worker:
         super().init_process() so that the ``run()`` loop is initiated.
         """
 
+        # Child side of the HTTP worker fork. Loading happens in this
+        # address space: either a cache hit of the master's preloaded
+        # callable or a fresh per-worker load in load_wsgi() below.
+        appload.note_worker_boot(self)
+
         # set environment' variables
         if self.cfg.env:
             for k, v in self.cfg.env.items():
@@ -124,6 +129,10 @@ class Worker:
         if self.cfg.reload:
             def changed(fname):
                 self.log.info("Worker reloading: %s modified", fname)
+                # This respawn stays on the worker ledger: the replacement
+                # process re-runs load_wsgi() in its own address space. It
+                # must never be reported as a dirty out-of-process load.
+                self._appload_note_reload_exit(fname)
                 self.alive = False
                 os.write(self.PIPE[1], b"1")
                 self.cfg.worker_int(self)
@@ -145,7 +154,17 @@ class Worker:
         self.booted = True
         self.run()
 
+    def _appload_note_reload_exit(self, fname):
+        # Indirection so the reload pin is emitted by the real reloader
+        # closure in init_process while remaining callable on its own.
+        appload.note_worker_reload_exit(self, fname)
+
     def load_wsgi(self):
+        # A non-None cached callable means the master preloaded it
+        # (preload_app) and this child inherited the pages: the wsgi() call
+        # below is a cache hit, not a fresh import. Otherwise the whole
+        # import path runs in this worker's own address space.
+        cache_hit = getattr(self.app, "callable", None) is not None
         try:
             self.wsgi = self.app.wsgi()
         except SyntaxError as e:
@@ -160,6 +179,14 @@ class Worker:
             with io.StringIO() as tb_string:
                 traceback.print_exception(e, file=tb_string)
                 self.wsgi = util.make_fail_app(tb_string.getvalue())
+            appload.note_worker_wsgi(self, "fail_app", cache_hit,
+                                     fail_app=True)
+        else:
+            appload.note_worker_wsgi(
+                self,
+                "cache_hit" if cache_hit else "fresh",
+                cache_hit,
+            )
 
     def init_signals(self):
         # reset signaling

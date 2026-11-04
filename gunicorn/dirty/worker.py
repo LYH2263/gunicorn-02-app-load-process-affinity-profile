@@ -74,7 +74,7 @@ import signal
 import traceback
 import uuid
 
-from gunicorn import util
+from gunicorn import appload, util
 from gunicorn.workers.workertmp import WorkerTmp
 
 from .app import load_dirty_apps
@@ -151,6 +151,11 @@ class DirtyWorker:
             for k, v in self.cfg.env.items():
                 os.environ[k] = v
 
+        # This is the out-of-process loading carrier: the child of a
+        # dirty arbiter. Every app class below is imported and initialized
+        # here, never inside an HTTP worker address space.
+        appload.note_dirty_worker_boot(self)
+
         util.set_owner_process(self.cfg.uid, self.cfg.gid,
                                initgroups=self.cfg.initgroups)
 
@@ -209,6 +214,9 @@ class DirtyWorker:
 
     def load_apps(self):
         """Load all configured dirty apps."""
+        # Records the exact assignment handed to this dirty worker, which
+        # may be a limited subset under module:Class:N / app_worker_map.
+        appload.note_dirty_apps_load(self)
         try:
             self.apps = load_dirty_apps(self.app_paths)
             for path, app in self.apps.items():
@@ -217,9 +225,14 @@ class DirtyWorker:
                     app.init()
                     self.log.info("Initialized dirty app: %s", path)
                 except Exception as e:
+                    # DirtyApp.init failed in the dirty worker process;
+                    # the pin stays dirty_init (out of HTTP workers).
+                    appload.note_dirty_init(self, path, "error", error=e)
                     self.log.error("Failed to initialize dirty app %s: %s",
                                    path, e)
                     raise
+                else:
+                    appload.note_dirty_init(self, path, "done")
         except Exception as e:
             self.log.error("Failed to load dirty apps: %s", e)
             raise

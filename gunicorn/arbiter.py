@@ -13,7 +13,7 @@ import socket
 
 from gunicorn.errors import HaltServer, AppImportError
 from gunicorn.pidfile import Pidfile
-from gunicorn import sock, systemd, util
+from gunicorn import appload, sock, systemd, util
 
 from gunicorn import __version__, SERVER_SOFTWARE
 
@@ -106,6 +106,30 @@ class Arbiter:
         self.cfg.nworkers_changed(self, value, old_value)
     num_workers = property(_get_num_workers, _set_num_workers)
 
+    def app_load_profile(self, sink=None):
+        """Enable the application-loading process-affinity profile.
+
+        Host-facing entry point for embedders.  The returned
+        :class:`gunicorn.appload.LoadProfile` is bound to *this* Arbiter
+        tree and inherited by every forked HTTP worker and by the dirty
+        arbiter subtree::
+
+            profile = arbiter.app_load_profile()
+            with profile.window("deploy") as win:
+                win.declare(appload.Pin.WORKER_LAZY, target)
+                ...
+
+        To also capture the master-side ``preload_app`` event, enable
+        profiling with :func:`gunicorn.appload.enable` *before*
+        constructing the Arbiter (``setup()`` preloads during ``__init__``);
+        enabling here still records every worker/dirty exit and any later
+        SIGHUP preload.  No new constructor parameter is introduced and
+        leaving the profile disabled keeps all loading paths unchanged.
+        """
+        tree_id = os.environ.get(appload.ENV_TREE)
+        sink = sink or os.environ.get(appload.ENV_SINK)
+        return appload.enable(tree_id=tree_id, sink=sink)
+
     def setup(self, app):
         self.app = app
         self.cfg = app.cfg
@@ -160,6 +184,11 @@ class Arbiter:
                 os.environ[k] = v
 
         if self.cfg.preload_app:
+            # The callable is cached in the master address space here,
+            # before any worker is forked. The profile records the master
+            # side of the preload pin; forked workers hit the cached
+            # callable in Worker.load_wsgi (the worker_inherited pin).
+            appload.note_master_preload(self.app)
             self.app.wsgi()
 
     def start(self):
@@ -735,6 +764,9 @@ class Arbiter:
             worker.pid = pid
             self.WORKERS[pid] = worker
             self._stats['workers_spawned'] += 1
+            # Master side of the HTTP worker fork boundary; the child side
+            # is appload.note_worker_boot() in Worker.init_process().
+            appload.note_worker_spawn(self, worker, pid)
             return pid
 
         # Do not inherit the temporary files of other workers
@@ -906,6 +938,11 @@ class Arbiter:
             # Set socket path for HTTP workers to use
             set_dirty_socket_path(socket_path)
             os.environ['GUNICORN_DIRTY_SOCKET'] = socket_path
+            # Master side of the out-of-process (dirty) subtree fork.
+            # The tree identity travels into the child through the inherited
+            # appload registry/environment; DirtyApp.init will run on that
+            # subtree, never in an HTTP worker address space.
+            appload.note_dirty_arbiter_spawn(self, pid, socket_path)
             self.log.info("Spawned dirty arbiter (pid: %s) at %s",
                           pid, socket_path)
             return pid
